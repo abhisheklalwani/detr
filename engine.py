@@ -12,6 +12,7 @@ import torch
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
+from util.f1 import confusion_matrix
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -72,6 +73,9 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = 'Test:'
+    true_positive_count_dict = {}
+    false_positive_count_dict = {}
+    false_negative_count_dict = {}
 
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
@@ -106,6 +110,47 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         results = postprocessors['bbox'](outputs, orig_target_sizes)
+
+        for target,result in zip(targets,results):
+            bounding_box_pred_dict_class_key = {}
+            bounding_box_ground_dict_class_key = {}
+            for label,box in zip(result['labels'],result['boxes']):
+                label = int(label)
+                box = box.cpu().numpy()
+                if label not in bounding_box_pred_dict_class_key:
+                    bounding_box_pred_dict_class_key[label] = [box]
+                else:
+                    bounding_box_pred_dict_class_key[label].append(box)
+                if label not in bounding_box_ground_dict_class_key:
+                    bounding_box_ground_dict_class_key[label] = []
+            for label,box in zip(target['labels'],target['boxes']):
+                xmin = (box[0]-(box[2]/2))*target['orig_size'][1]
+                ymin = (box[1]-(box[3]/2))*target['orig_size'][0]
+                xmax = (box[0]+(box[2]/2))*target['orig_size'][1]
+                ymax = (box[1]+(box[3]/2))*target['orig_size'][0]
+                box = [xmin,ymin,xmax,ymax]
+                label = int(label)
+                if label not in bounding_box_ground_dict_class_key:
+                    bounding_box_ground_dict_class_key[label] = [box]
+                else:
+                    bounding_box_ground_dict_class_key[label].append(box)
+                if label not in bounding_box_pred_dict_class_key:
+                    bounding_box_pred_dict_class_key[label] = []
+            for label in bounding_box_pred_dict_class_key.keys():
+                true_positive_count,false_postive_count,false_negative_count = confusion_matrix(bounding_box_pred_dict_class_key[label],bounding_box_ground_dict_class_key[label],0.5)
+                if int(label) not in true_positive_count_dict:
+                    true_positive_count_dict[int(label)] = true_positive_count
+                else:
+                    true_positive_count_dict[int(label)]+=true_positive_count
+                if int(label) not in false_positive_count_dict:
+                    false_positive_count_dict[int(label)] = false_postive_count
+                else:
+                    false_positive_count_dict[int(label)]+=false_postive_count
+                if int(label) not in false_negative_count_dict:
+                    false_negative_count_dict[int(label)] = false_negative_count
+                else:
+                    false_negative_count_dict[int(label)]+=false_negative_count
+            
         if 'segm' in postprocessors.keys():
             target_sizes = torch.stack([t["size"] for t in targets], dim=0)
             results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
@@ -122,6 +167,11 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
                 res_pano[i]["file_name"] = file_name
 
             panoptic_evaluator.update(res_pano)
+    for label in sorted(true_positive_count_dict.keys()):
+        precision = true_positive_count_dict[label]/(true_positive_count_dict[label]+false_positive_count_dict[label]+1e-16)
+        recall = true_positive_count_dict[label]/(true_positive_count_dict[label]+false_negative_count_dict[label]+1e-16)
+        f1_score = 2*precision*recall/(precision+recall+1e-16)
+        print('F-1 score for class '+str(label)+' : '+str(f1_score))
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
